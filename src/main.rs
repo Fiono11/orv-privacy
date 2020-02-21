@@ -1,90 +1,117 @@
-mod cross_base_proof;
 mod elgamal_proof;
-mod secret_sharing;
 
-use bulletproofs::{BulletproofGens, PedersenGens, RangeProof};
-use cross_base_proof::CrossBaseProof;
-use curve25519_dalek::constants::{
-    RISTRETTO_BASEPOINT_COMPRESSED, RISTRETTO_BASEPOINT_POINT, RISTRETTO_BASEPOINT_TABLE,
-};
 use curve25519_dalek::ristretto::RistrettoPoint;
 use curve25519_dalek::scalar::Scalar;
+use rand::rngs::OsRng;
+use sha2::{Digest, Sha512};
+use rand::{CryptoRng, RngCore};
+use curve25519_dalek::constants::{RISTRETTO_BASEPOINT_POINT, RISTRETTO_BASEPOINT_TABLE};
+use rand::Rng;
+use bulletproofs::{BulletproofGens, PedersenGens, RangeProof};
 use elgamal_proof::ElgamalProof;
 use merlin::Transcript;
-use rand::rngs::OsRng;
-use rand::Rng;
-use sha2::{Digest, Sha512};
-use std::convert::TryInto;
+use curve25519_dalek::traits::Identity;
 
 const NUM_REP_SHARES: u16 = 10;
 const NUM_REP_SHARES_NEEDED: u16 = NUM_REP_SHARES * 2 / 3;
-const DOMAIN_NAME: &[u8] = b"PlasmaPower/orv-privacy";
+const DOMAIN_NAME: &[u8] = b"Fiono11/orv-privacy";
 
 fn main() {
-    println!("Generating shared rep key and secret sharing..");
+
     let mut rng = OsRng;
-    let decryption_key_base = Sha512::new()
-        .chain("commitment decryption key basepoint\0")
-        .chain(RISTRETTO_BASEPOINT_COMPRESSED.as_bytes());
-    let decryption_key_base = RistrettoPoint::from_hash(decryption_key_base);
-    let mut rep_keys = Vec::new();
-    let mut rep_pubkeys = Vec::new();
-    // this could be parallelized, and only needs to run e.g. daily
-    for _ in 0..NUM_REP_SHARES {
-        let secret = Scalar::random(&mut rng);
-        let (verification, shares) = secret_sharing::generate(
-            &mut rng,
-            &decryption_key_base,
-            secret,
-            NUM_REP_SHARES_NEEDED,
-            NUM_REP_SHARES,
-        );
-        // other reps can verify their shares
-        // they also need to sign messages saying they've seen this verification
-        // otherwise, a malicious dealer could give each a share to a different polynomial
-        assert_eq!(verification.get_needed(), NUM_REP_SHARES_NEEDED);
-        for (i, &share) in shares.iter().enumerate() {
-            assert!(verification
-                .validate(&decryption_key_base, (i + 1).try_into().unwrap(), share)
-                .is_ok());
+    let basepoint = RISTRETTO_BASEPOINT_POINT;
+    let mut public_keys = Vec::with_capacity(usize::from(NUM_REP_SHARES)); 
+    let mut private_keys = Vec::with_capacity(usize::from(NUM_REP_SHARES));
+    let mut points = Vec::with_capacity(usize::from(NUM_REP_SHARES));
+    let mut total_shares = Vec::with_capacity(usize::from(NUM_REP_SHARES));
+
+    /// Each participant generates his public key
+    for x in 0..NUM_REP_SHARES {
+        let private_key = Scalar::random(&mut rng);
+        private_keys.push(private_key);
+        let public_key = private_key * basepoint;
+        public_keys.push(public_key);
+    }
+
+    /// The dealer chooses a random polynomial f(x) of degree NUM_REP_SHARES_NEEDED-1, where f(0) is the subsecret
+    for i in 0..NUM_REP_SHARES {
+        let mut coeffs = Vec::with_capacity(usize::from(NUM_REP_SHARES_NEEDED));
+        points.push(Scalar::from((i+1) as u64));
+        coeffs.push(private_keys[i as usize]);
+
+        for j in 1..NUM_REP_SHARES_NEEDED {
+            coeffs.push(Scalar::random(&mut rng));
         }
-        // and if the rep goes offline, recombine their shares
-        // after being released, each of these shares could also be verified by other reps
-        let shares = &shares[1..=usize::from(NUM_REP_SHARES_NEEDED)];
-        let share_nums: Vec<u16> = (2..(2 + NUM_REP_SHARES_NEEDED)).collect();
-        assert_eq!(
-            secret_sharing::combine_shares(&share_nums, shares),
-            Ok(secret),
-        );
-        rep_pubkeys.push(verification.get_public().clone());
-        rep_keys.push(secret);
+
+        /// Commitments to the NUM_REP_SHARES_NEEDED coefficients of the f(x) polynomial
+        let committed_coeffs: Vec<RistrettoPoint> = coeffs.iter().map(|c| c * basepoint).collect();
+
+        /// The dealer computes the encrypted shares
+        let mut encrypted_shares = Vec::with_capacity(usize::from(NUM_REP_SHARES));
+        let mut committed_shares = Vec::with_capacity(usize::from(NUM_REP_SHARES));
+        let mut shares = Vec::with_capacity(usize::from(NUM_REP_SHARES));
+        
+        for x in 0..NUM_REP_SHARES {
+            let x_scalar = Scalar::from(u64::from(x+1));
+            let mut curr_x_pow = Scalar::one();
+            let mut share = Scalar::zero();
+            for coeff in &coeffs {
+                share += coeff * curr_x_pow;
+                curr_x_pow *= x_scalar;
+            }
+            let committed_share = share * basepoint;
+            let encrypted_share = share * public_keys[x as usize];
+            committed_shares.push(committed_share);
+            encrypted_shares.push(encrypted_share);
+            shares.push(share);
+            if total_shares.len() == NUM_REP_SHARES as usize {
+                total_shares[x as usize] += share;
+            }
+            else {
+                total_shares.push(share);
+            }
+        }
+
+        /// The dealer proves in zero-knowledge that the committed shares and the encrypted shares have the same exponent
+        for i in 0..NUM_REP_SHARES {
+            for j in (0..NUM_REP_SHARES).rev() {
+                let c = Sha512::new()
+                    .chain(committed_shares[i as usize].compress().as_bytes())
+                    .chain(committed_shares[j as usize].compress().as_bytes())
+                    .chain(encrypted_shares[i as usize].compress().as_bytes())
+                    .chain(encrypted_shares[j as usize].compress().as_bytes());
+                let c1 = Scalar::from_hash(c);
+                let r1 = shares[j as usize] - shares[i as usize] * c1;
+                let r2 = shares[j as usize] - shares[j as usize] * c1;
+                
+                let a1 = r1 * basepoint + c1 * committed_shares[i as usize];
+                let a2 = r2 * public_keys[j as usize] + c1 * encrypted_shares[j as usize];
+
+                let c2 = Sha512::new()
+                    .chain(committed_shares[i as usize].compress().as_bytes())
+                    .chain(a1.compress().as_bytes())
+                    .chain(encrypted_shares[i as usize].compress().as_bytes())
+                    .chain(a2.compress().as_bytes());
+
+                let c2 = Scalar::from_hash(c2);
+
+                assert_eq!(c1, c2);
+            }
+        }
     }
-    // aggregate rep_pubkeys into blinding_base in a way safe against rogue key attacks
-    // this is based on MuSig key aggregation - agg_mul_base is l
-    let mut agg_mul_base = Sha512::new();
-    for pubkey in &rep_pubkeys {
-        agg_mul_base.input(pubkey.compress().as_bytes());
-    }
-    let agg_mul_base = agg_mul_base.result();
-    let mut blinding_base = RistrettoPoint::default();
-    for pubkey in &rep_pubkeys {
-        let multiplier = Scalar::from_hash(
-            Sha512::new()
-                .chain(agg_mul_base.as_slice())
-                .chain(pubkey.compress().as_bytes()),
-        );
-        blinding_base += pubkey * multiplier;
-    }
+
+    let elgamal_public_key = public_keys.iter().sum();
 
     println!("Done secret sharing, initializing bulletproofs..");
     let bulletproof_gens = BulletproofGens::new(32, 1);
     let pedersen_gens = PedersenGens {
         B: RISTRETTO_BASEPOINT_POINT,
-        B_blinding: blinding_base,
+        B_blinding: elgamal_public_key,
     };
+
     println!("Done initializing bulletproofs, generating 2 commitments and proofs..");
     let blinding_key1 = Scalar::random(&mut rng);
-    let decryption_key1 = blinding_key1 * decryption_key_base;
+    let decryption_key1 = blinding_key1 * RISTRETTO_BASEPOINT_POINT;
     let balance1 = u64::from(rng.gen::<u32>() / 10);
     let (range_proof1, commitment1) = RangeProof::prove_single(
         &bulletproof_gens,
@@ -98,13 +125,13 @@ fn main() {
     let elgamal_proof1 = ElgamalProof::new(
         &mut rng,
         blinding_key1,
-        &blinding_base,
+        &elgamal_public_key,
         balance1,
-        &decryption_key_base,
+        &RISTRETTO_BASEPOINT_POINT,
     );
 
     let blinding_key2 = Scalar::random(&mut rng);
-    let decryption_key2 = blinding_key2 * decryption_key_base;
+    let decryption_key2 = blinding_key2 * RISTRETTO_BASEPOINT_POINT;
     let balance2 = u64::from(rng.gen::<u32>() / 10);
     let (range_proof2, commitment2) = RangeProof::prove_single(
         &bulletproof_gens,
@@ -118,9 +145,9 @@ fn main() {
     let elgamal_proof2 = ElgamalProof::new(
         &mut rng,
         blinding_key2,
-        &blinding_base,
+        &elgamal_public_key,
         balance2,
-        &decryption_key_base,
+        &RISTRETTO_BASEPOINT_POINT,
     );
 
     println!("Done generating commitments and proofs, verifying them..");
@@ -154,58 +181,60 @@ fn main() {
         .verify(
             &commitment1,
             &decryption_key1,
-            &blinding_base,
-            &decryption_key_base
+            &elgamal_public_key,
+            &RISTRETTO_BASEPOINT_POINT
         )
         .is_ok());
     assert!(elgamal_proof2
         .verify(
             &commitment2,
             &decryption_key2,
-            &blinding_base,
-            &decryption_key_base
+            &elgamal_public_key,
+            &RISTRETTO_BASEPOINT_POINT
         )
         .is_ok());
 
     println!("Done verifying proofs, decrypting total balance..");
+
     let total_weight = balance1 + balance2;
     let total_commitment = commitment1 + commitment2;
-    let total_decryption_keys = decryption_key1 + decryption_key2;
-    let mut shared_key = RistrettoPoint::default();
-    for (rep_key, rep_pubkey) in rep_keys.into_iter().zip(rep_pubkeys.into_iter()) {
-        // if they are offline, this could be recovered via secert sharing as shown above
-        let shared_key_part = rep_key * total_decryption_keys;
-        let equality_sig = CrossBaseProof::new(
-            &mut rng,
-            &decryption_key_base,
-            &total_decryption_keys,
-            rep_key,
-        );
-        // the public can validate shared_key_part, assuring them that decryption is correct
-        assert!(equality_sig
-            .validate(
-                &decryption_key_base,
-                &rep_pubkey,
-                &total_decryption_keys,
-                &shared_key_part,
-            )
-            .is_ok());
-        let key_multiplier = Scalar::from_hash(
-            Sha512::new()
-                .chain(agg_mul_base.as_slice())
-                .chain(rep_pubkey.compress().as_bytes()),
-        );
-        shared_key += shared_key_part * key_multiplier;
+    let total_blinding_key = blinding_key1 + blinding_key2;
+    let elgamal_private_key: Scalar = private_keys.iter().sum();
+    let g = RISTRETTO_BASEPOINT_POINT;
+    let y = elgamal_public_key;
+
+    // ElGamal ciphertext
+    let (c1, c2) = (g * total_blinding_key, total_commitment);
+
+    assert_eq!(commitment1, Scalar::from(balance1) * g + y * blinding_key1);
+    assert_eq!(total_commitment, Scalar::from(balance1+balance2) * g + y * total_blinding_key);
+    
+    println!("Done verifying proofs, decrypting total balance with lagrange interpolation..");
+
+    let mut acc = Scalar::from(0u64);
+    let mut d = RistrettoPoint::identity();
+
+    for i in 0..total_shares.len() {
+            
+        let xi: Scalar = points[i];
+        let yi = total_shares[i];
+        let mut num = Scalar::from(1u64);
+        let mut denum = Scalar::from(1u64);
+            
+        for j in 0..total_shares.len() {
+            if j != i {
+                let xj = points[j];
+                num = num * &xj;
+                denum = denum * &(xj - &xi);
+            }
+        }
+
+        acc = acc + &(yi * &(num * &denum.invert())); 
+        // The decryption shares
+        d = d + &(c1 * (&(yi * &(num * &denum.invert()))));
     }
-    // confirm that we've extracted the value
-    // to actually get the value, we could use something like a rainbow table
-    // E.g. precalculate all possible curve points, but only store curve points
-    // whose first byte is 0. When doing lookup, add G until the curve point's
-    // first byte is 0, then it's guaranteed to be in the table (which is small)
-    let commitment_value = total_commitment - shared_key;
-    assert_eq!(
-        commitment_value,
-        &Scalar::from(total_weight) * &RISTRETTO_BASEPOINT_TABLE,
-    );
-    println!("Successfully recovered total balance!");
+
+    assert_eq!(elgamal_public_key, elgamal_private_key * RISTRETTO_BASEPOINT_POINT);
+    assert_eq!(Scalar::from(balance1+balance2) * g, c2 - &d);
+    assert_eq!(elgamal_private_key, acc);
 }
