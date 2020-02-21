@@ -1,4 +1,5 @@
 mod elgamal_proof;
+mod cross_base_proof;
 
 use curve25519_dalek::ristretto::RistrettoPoint;
 use curve25519_dalek::scalar::Scalar;
@@ -9,11 +10,13 @@ use curve25519_dalek::constants::{RISTRETTO_BASEPOINT_POINT, RISTRETTO_BASEPOINT
 use rand::Rng;
 use bulletproofs::{BulletproofGens, PedersenGens, RangeProof};
 use elgamal_proof::ElgamalProof;
+use cross_base_proof::CrossBaseProof;
 use merlin::Transcript;
 use curve25519_dalek::traits::Identity;
 
-const NUM_REP_SHARES: u16 = 10;
-const NUM_REP_SHARES_NEEDED: u16 = NUM_REP_SHARES * 2 / 3;
+
+const NUM_REP_SHARES: usize = 11;
+const NUM_REP_SHARES_NEEDED: usize = NUM_REP_SHARES * 2 / 3;
 const DOMAIN_NAME: &[u8] = b"Fiono11/orv-privacy";
 
 fn main() {
@@ -37,7 +40,7 @@ fn main() {
     for i in 0..NUM_REP_SHARES {
         let mut coeffs = Vec::with_capacity(usize::from(NUM_REP_SHARES_NEEDED));
         points.push(Scalar::from((i+1) as u64));
-        coeffs.push(private_keys[i as usize]);
+        coeffs.push(private_keys[i]);
 
         for j in 1..NUM_REP_SHARES_NEEDED {
             coeffs.push(Scalar::random(&mut rng));
@@ -52,7 +55,7 @@ fn main() {
         let mut shares = Vec::with_capacity(usize::from(NUM_REP_SHARES));
         
         for x in 0..NUM_REP_SHARES {
-            let x_scalar = Scalar::from(u64::from(x+1));
+            let x_scalar = Scalar::from((x+1) as u64);
             let mut curr_x_pow = Scalar::one();
             let mut share = Scalar::zero();
             for coeff in &coeffs {
@@ -60,12 +63,12 @@ fn main() {
                 curr_x_pow *= x_scalar;
             }
             let committed_share = share * basepoint;
-            let encrypted_share = share * public_keys[x as usize];
+            let encrypted_share = share * public_keys[x];
             committed_shares.push(committed_share);
             encrypted_shares.push(encrypted_share);
             shares.push(share);
-            if total_shares.len() == NUM_REP_SHARES as usize {
-                total_shares[x as usize] += share;
+            if total_shares.len() == NUM_REP_SHARES {
+                total_shares[x] += share;
             }
             else {
                 total_shares.push(share);
@@ -74,29 +77,11 @@ fn main() {
 
         /// The dealer proves in zero-knowledge that the committed shares and the encrypted shares have the same exponent
         for i in 0..NUM_REP_SHARES {
-            for j in (0..NUM_REP_SHARES).rev() {
-                let c = Sha512::new()
-                    .chain(committed_shares[i as usize].compress().as_bytes())
-                    .chain(committed_shares[j as usize].compress().as_bytes())
-                    .chain(encrypted_shares[i as usize].compress().as_bytes())
-                    .chain(encrypted_shares[j as usize].compress().as_bytes());
-                let c1 = Scalar::from_hash(c);
-                let r1 = shares[j as usize] - shares[i as usize] * c1;
-                let r2 = shares[j as usize] - shares[j as usize] * c1;
-                
-                let a1 = r1 * basepoint + c1 * committed_shares[i as usize];
-                let a2 = r2 * public_keys[j as usize] + c1 * encrypted_shares[j as usize];
-
-                let c2 = Sha512::new()
-                    .chain(committed_shares[i as usize].compress().as_bytes())
-                    .chain(a1.compress().as_bytes())
-                    .chain(encrypted_shares[i as usize].compress().as_bytes())
-                    .chain(a2.compress().as_bytes());
-
-                let c2 = Scalar::from_hash(c2);
-
-                assert_eq!(c1, c2);
-            }
+            let pubkey = public_keys[i];
+            let proof = CrossBaseProof::new(&mut rng, &basepoint, &pubkey, shares[i]);
+            let com = committed_shares[i];
+            let enc = encrypted_shares[i];
+            proof.validate(&basepoint, &com, &pubkey, &enc).unwrap();
         }
     }
 
